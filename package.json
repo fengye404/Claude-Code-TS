@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "s01": "tsx src/s01_agent_loop.ts",
+    "s02": "tsx src/s02_tool_use.ts",
     "build": "tsc"
   },
   "dependencies": {
