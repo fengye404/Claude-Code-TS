@@ -1,3 +1,16 @@
+/**
+ * S02 - Tool Use：在 S01 基础上扩展文件操作工具
+ *
+ * 新增工具：
+ *   - read_file   读取文件内容（支持行数限制）
+ *   - write_file  写入文件（自动创建父目录）
+ *   - edit_file   替换文件中指定文本（仅替换首次出现）
+ *
+ * 安全措施：
+ *   - 所有文件路径经过 safePath() 沙箱检查，禁止逃逸出工作目录
+ *   - bash 命令沿用 S01 的危险命令拦截
+ */
+
 import "dotenv/config";
 import { createInterface } from "node:readline";
 import { execSync } from "node:child_process";
@@ -7,13 +20,24 @@ import { generateText, type CoreMessage } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 
+// ── 常量 ──────────────────────────────────────────────
+
+/** 单次工具输出最大字符数，防止上下文爆炸 */
 const MAX_OUTPUT = 50_000;
+/** 终端预览截断长度 */
 const PREVIEW_LEN = 200;
+/** bash 命令超时时间（ms） */
 const TIMEOUT_MS = 120_000;
+/** 单轮对话最大 tool-use 步数 */
 const MAX_STEPS = 30;
+/** 是否启用 ANSI 颜色输出 */
 const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+/** 锁定的工作目录，所有路径操作基于此 */
 const WORKDIR = process.cwd();
+/** 需要拦截的危险命令关键词正则 */
 const BLOCKED_KEYWORD_RULES: ReadonlyArray<RegExp> = [/\bsudo\b/, /\bshutdown\b/, /\breboot\b/, />\s*\/dev\//];
+
+// ── 终端颜色 ──────────────────────────────────────────
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -22,21 +46,31 @@ const ANSI = {
 
 type FgColor = keyof typeof ANSI.fg;
 
+// ── LLM 配置 ─────────────────────────────────────────
+
 const provider = createAnthropic({ baseURL: process.env.ANTHROPIC_BASE_URL });
 const model = provider(process.env.MODEL_ID ?? "claude-sonnet-4-6");
 const system = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.`;
 
+// ── 辅助函数 ─────────────────────────────────────────
+
+/** 给文本着色，非 TTY 环境不着色 */
 function paint(text: string, color: FgColor): string {
   if (!USE_COLOR) return text;
   return `${ANSI.fg[color]}${text}${ANSI.reset}`;
 }
 
+/** 在终端打印截断后的预览 */
 function preview(text: string): void {
   console.log(text.slice(0, PREVIEW_LEN) + (text.length > PREVIEW_LEN ? "..." : ""));
 }
 
-// --- Path sandbox ---
+// ── 路径沙箱 ─────────────────────────────────────────
 
+/**
+ * 将相对路径解析为绝对路径，并校验不超出工作目录。
+ * 防止 `../../etc/passwd` 之类的路径穿越攻击。
+ */
 function safePath(p: string): string {
   const resolved = resolve(WORKDIR, p);
   if (!resolved.startsWith(WORKDIR)) {
@@ -45,8 +79,9 @@ function safePath(p: string): string {
   return resolved;
 }
 
-// --- Tool handlers ---
+// ── 命令安全检查 ──────────────────────────────────────
 
+/** 检测 `rm -rf /` 这类毁灭性命令 */
 function hasDangerousRmRoot(command: string): boolean {
   const hasRm = /\brm\b/.test(command);
   const hasRootTarget = /(^|\s)\/(\s|$)/.test(command);
@@ -54,11 +89,15 @@ function hasDangerousRmRoot(command: string): boolean {
   return hasRm && hasRootTarget && hasRfOrFrFlag;
 }
 
+/** 综合判断命令是否应被拦截 */
 function isDangerousCommand(rawCommand: string): boolean {
   const command = rawCommand.trim().toLowerCase();
   return hasDangerousRmRoot(command) || BLOCKED_KEYWORD_RULES.some((rule) => rule.test(command));
 }
 
+// ── Bash 工具实现 ────────────────────────────────────
+
+/** 执行 bash 命令并返回截断后的输出，危险命令直接拒绝 */
 function runBash(command: string): string {
   console.log(paint(`$ ${command}`, "yellow"));
   if (isDangerousCommand(command)) return "Error: Dangerous command blocked";
@@ -81,6 +120,9 @@ function runBash(command: string): string {
   }
 }
 
+// ── 文件工具实现 ─────────────────────────────────────
+
+/** 读取文件内容，可通过 limit 限制返回行数 */
 function runReadFile(path: string, limit?: number): string {
   try {
     const fp = safePath(path);
@@ -97,6 +139,7 @@ function runReadFile(path: string, limit?: number): string {
   }
 }
 
+/** 写入文件，自动递归创建不存在的父目录 */
 function runWriteFile(path: string, content: string): string {
   try {
     const fp = safePath(path);
@@ -108,6 +151,7 @@ function runWriteFile(path: string, content: string): string {
   }
 }
 
+/** 在文件中查找 oldText 并替换为 newText（仅首次出现） */
 function runEditFile(path: string, oldText: string, newText: string): string {
   try {
     const fp = safePath(path);
@@ -122,7 +166,7 @@ function runEditFile(path: string, oldText: string, newText: string): string {
   }
 }
 
-// --- Tools ---
+// ── 工具定义 ─────────────────────────────────────────
 
 const tools = {
   bash: {
@@ -159,13 +203,14 @@ const tools = {
   },
 };
 
-// --- REPL ---
+// ── REPL 主循环 ──────────────────────────────────────
 
 async function main() {
   const messages: CoreMessage[] = [];
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   process.on("SIGINT", () => process.exit(0));
 
+  /** 读取一行用户输入，EOF / close 时返回 null */
   const ask = (): Promise<string | null> =>
     new Promise((resolve) => {
       const onClose = () => resolve(null);
@@ -176,6 +221,7 @@ async function main() {
       });
     });
 
+  // 主循环：读取输入 → 调用 LLM → 输出结果
   while (true) {
     const input = await ask();
     if (input === null || input === "" || input === "q" || input === "exit") break;
