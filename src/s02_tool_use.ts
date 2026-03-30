@@ -14,7 +14,7 @@
 import "dotenv/config";
 import { createInterface } from "node:readline";
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
+import { resolve, relative, dirname } from "node:path";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { generateText, type CoreMessage } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -73,7 +73,12 @@ function preview(text: string): void {
  */
 function safePath(p: string): string {
   const resolved = resolve(WORKDIR, p);
-  if (!resolved.startsWith(WORKDIR)) {
+  const rel = relative(WORKDIR, resolved);
+  // Reject parent traversal and absolute rel paths (e.g., different drive letters on Windows).
+  if (rel === ".." || rel.startsWith(`..${"/"}`) || rel.startsWith(`..${"\\"}`)) {
+    throw new Error(`Path escapes workspace: ${p}`);
+  }
+  if (resolve(WORKDIR, rel) !== resolved) {
     throw new Error(`Path escapes workspace: ${p}`);
   }
   return resolved;
@@ -143,7 +148,7 @@ function runReadFile(path: string, limit?: number): string {
 function runWriteFile(path: string, content: string): string {
   try {
     const fp = safePath(path);
-    mkdirSync(resolve(fp, ".."), { recursive: true });
+    mkdirSync(dirname(fp), { recursive: true });
     writeFileSync(fp, content, "utf-8");
     return `Wrote ${content.length} bytes to ${path}`;
   } catch (err: unknown) {
